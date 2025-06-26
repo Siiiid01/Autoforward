@@ -1,64 +1,59 @@
-import asyncio, os
+import asyncio
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from config import *
-from db import ensure_doc, update
 
-app  = Client("autofwd", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-WAIT = {}  # per-admin mini-state machine
+from config     import API_ID, API_HASH, BOT_TOKEN, OWNER_ID
+from db         import ensure_doc, update
+from forwarder  import queue, worker, style
 
-@app.on_message(filters.command("start"))
-async def start(_, m): await m.reply("👋 Hi! Use /f_on to set up auto-copy.")
+app = Client("autofwd", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# cmd handler (admin‑only)
 @app.on_message(filters.command("f_on") & filters.user(OWNER_ID))
 async def f_on(_, m):
     cfg = await ensure_doc()
-    if cfg["active"]:
-        kb  = InlineKeyboardMarkup([[InlineKeyboardButton("Set new IDs", b"new"),
-                                     InlineKeyboardButton("Deactivate", b"off")]])
-        cap = f"🔄 Active\nSRC: `{cfg['src']}`\nDST: `{cfg['dest']}`"
-        await m.reply_photo("https://i.imgur.com/GrJ3l2Q.png", caption=cap, reply_markup=kb)
+    if cfg["src"] and cfg["dest"]:
+        cap  = style(f"forwarding active\nsource: {cfg['src']}\ndest: {cfg['dest']}")
+        kb   = InlineKeyboardMarkup([[InlineKeyboardButton("set new ids", b"reset")]])
+        await m.reply_caption(cap, reply_markup=kb)
     else:
-        await m.reply("Send **source** channel ID (or forward a post).")
-        WAIT[m.from_user.id] = "src"
+        await update(active=True)
+        await m.reply_text(style("send source channel id"))
 
+# callback for reset button
 @app.on_callback_query(filters.user(OWNER_ID))
-async def cb(_, q):
-    if q.data == "new":
-        await update(active=False, src=None, dest=None)
-        await q.message.edit("Old IDs cleared.\nSend **source** channel ID.")
-        WAIT[q.from_user.id] = "src"
-    elif q.data == "off":
-        await update(active=False)
-        await q.message.edit("🔕 Auto-copy paused.")
+async def callbacks(_, q):
+    if q.data == "reset":
+        await update(src=None, dest=None, active=True)
+        await q.message.edit_caption(style("send source channel id"))
 
+# id collection step‑by‑step
 @app.on_message(filters.private & filters.user(OWNER_ID))
-async def id_collector(_, m):
-    if m.from_user.id not in WAIT: return
-    step = WAIT[m.from_user.id]
-    cid  = m.forward_from_chat.id if m.forward_from_chat else int(m.text)
-    if step == "src":
-        await update(src=cid)
-        WAIT[m.from_user.id] = "dest"
-        await m.reply("Got it. Now send **destination** channel ID (or forward a post).")
-    elif step == "dest":
-        await update(dest=cid, active=True)
-        WAIT.pop(m.from_user.id, None)
-        cfg = await ensure_doc()
-        cap = f"✅ Set!\nSRC: `{cfg['src']}`\nDST: `{cfg['dest']}`\nAuto-copy is live."
-        await m.reply_photo("https://i.imgur.com/FQz0MY5.png", caption=cap)
-
-@app.on_message(filters.channel)
-async def copier(_, msg):
+async def collect_ids(_, m):
     cfg = await ensure_doc()
-    if not cfg["active"] or msg.chat.id != cfg["src"]: return
-    try:
-        await asyncio.sleep(DELAY_SECS)
-        await msg.copy(cfg["dest"])
-    except FloodWait as e:
-        await asyncio.sleep(e.value + 1)
-        await msg.copy(cfg["dest"])
+    if cfg["active"] and not cfg["src"]:
+        await update(src=int(m.text))
+        await m.reply_text(style("source saved\nsend dest id"))
+    elif cfg["active"] and cfg["src"] and not cfg["dest"]:
+        await update(dest=int(m.text), active=False)
+        await m.reply_text(style("destination saved\nwatching source"))
+        # start queue worker now that both ids exist
+        asyncio.create_task(worker(app, int(m.text)))
+
+# watch channel posts
+@app.on_message(filters.channel)
+async def enqueue(_, msg):
+    cfg = await ensure_doc()
+    if cfg["src"] and cfg["dest"] and msg.chat.id == cfg["src"]:
+        await queue.put(msg)
+
+async def main():
+    await app.start()
+    cfg = await ensure_doc()
+    if cfg["src"] and cfg["dest"]:
+        asyncio.create_task(worker(app, cfg["dest"]))
+    print("• autofwd running •")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    app.run()
+    asyncio.run(main())

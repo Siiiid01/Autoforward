@@ -1,8 +1,9 @@
 from motor.motor_asyncio import AsyncIOMotorClient
-from config import MONGO_URI
+from config import MONGO_URI, MONGO_DB
 
 cli  = AsyncIOMotorClient(MONGO_URI)
-coll = cli.autoforward.settings
+db   = cli[MONGO_DB]                     # explicit db
+coll = db.settings
 
 async def ensure_doc():
     doc = await coll.find_one({"_id": "global"})
